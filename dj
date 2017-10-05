@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+
+import json
+import os
+import re
+from argparse import ArgumentParser
+
+import readline
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials, SpotifyOauthError
+from spotipy.util import prompt_for_user_token
+from datetime import timedelta
+
+from termcolor import cprint
+
+CACHE_DIR = '.'
+
+
+def make_private_client(username):
+    scopes = ['user-modify-playback-state', 'user-read-playback-state', 'user-read-currently-playing',
+              'playlist-read-private',
+              'playlist-read-collaborative']
+    # ['playlist-modify-private', 'playlist-modify-public', ]
+    token = prompt_for_user_token(username, redirect_uri='http://localhost/', scope=' '.join(scopes))
+    return spotipy.Spotify(auth=token)
+
+
+class TempoCatalog(object):
+    def __init__(self, spotify, user, rebuild=False, pattern='WCS([0-9]+)'):
+        self.spotify = spotify
+        self.user = user
+
+        cache_missing = '.tempo' not in os.listdir(CACHE_DIR)
+        if cache_missing:
+            print('Tempo cache missing - recreating')
+
+        if cache_missing or rebuild:
+            self._tempo = {}
+            pattern = re.compile(pattern)
+            for playlist in all_items(spotify, spotify.current_user_playlists()):
+                m = pattern.match(playlist['name'])
+                if m:
+                    tempo = int(m.group(1))
+                    tracks = get_playlist_tracks(spotify, user, playlist)
+                    print('{}, {} bpm - {} tracks'.format(playlist['name'], tempo, len(tracks)))
+                    for t in tracks:
+                        self._tempo[t['id']] = tempo
+            print()
+            self._store()
+        else:
+            self._read_cached()
+
+    def _store(self):
+        with open(os.path.join(CACHE_DIR, '.tempo'), 'w') as f:
+            json.dump(self._tempo, f, indent=4)
+
+    def _read_cached(self):
+        with open(os.path.join(CACHE_DIR, '.tempo'), 'r') as f:
+            self._tempo = json.load(f)
+
+    def get_tempo(self, track, default=None):
+        try:
+            return self._tempo[_extract_id(track)]
+        except KeyError:
+            if default is not None:
+                return default
+            else:
+                raise
+
+    def __contains__(self, item):
+        return _extract_id(item) in self._tempo
+
+
+def _extract_id(track):
+    if isinstance(track, str):
+        track_id = track
+    else:
+        track_id = track['id']
+    return track_id
+
+
+class PlaylistNotFound(Exception):
+    pass
+
+
+def get_playlist_by_name(spotify, playlist_name):
+    for playlist in all_items(spotify, spotify.current_user_playlists()):
+        if playlist['name'] == playlist_name:
+            return playlist
+    raise PlaylistNotFound(playlist_name)
+
+
+def print_playlists(spotify):
+    for i, playlist in enumerate(all_items(spotify, spotify.current_user_playlists())):
+        print("%4d %s %s" % (i + 1, playlist['uri'], playlist['name']))
+
+
+def all_items(spotify, first_call_result):
+    result = first_call_result
+    while result:
+        for item in result['items']:
+            yield item
+        if result['next']:
+            result = spotify.next(result)
+        else:
+            result = None
+
+
+def get_playlist_tracks(spotify, user, playlist):
+    """
+    :param Spotify spotify:
+    :param str user:
+    :param dict|str playlist:
+    :rtype: list[dict]
+    """
+    if isinstance(playlist, str):
+        playlist_id = playlist
+    else:
+        playlist_id = playlist['id']
+    return [t['track'] for t in all_items(spotify, spotify.user_playlist_tracks(user, playlist_id))]
+
+
+def get_tracks_features(spotify, tracks):
+    if all(isinstance(t, str) for t in tracks):
+        track_ids = tracks
+    else:
+        track_ids = [t['id'] for t in tracks]
+    return spotify.audio_features(track_ids)
+
+
+def cached_user():
+    pattern = re.compile('\.cache-([a-zA-Z0-9]+)')
+    for f in os.listdir(CACHE_DIR):
+        m = pattern.match(f)
+        if m:
+            print('User:', m.group(1))
+            return m.group(1)
+    return None
+
+
+def parse_args():
+    cmd_prefix = 'command_'
+    commands = [c[len(cmd_prefix):] for c in globals() if c.startswith(cmd_prefix)]
+    p = ArgumentParser()
+    p.add_argument('cmd', metavar='COMMAND', choices=commands, help=', '.join(commands))
+    p.add_argument('-u', '--user', default=cached_user())
+    p.add_argument('--tempo_pattern', default='WCS([0-9]+)')
+    args, cmd_arg_list = p.parse_known_args()
+
+    if not args.user:
+        print('Session not cached, provide --user parameter')
+        exit(1)
+
+    return args, cmd_arg_list
+
+
+def command_playlists(spotify, args, cmd_arg_list):
+    pattern = re.compile(args.tempo_pattern)
+    playlists = (p for p in all_items(spotify, spotify.current_user_playlists()) if not pattern.match(p['name']))
+    for i, p in enumerate(playlists):
+        if not pattern.match(p['name']):
+            print('{}. {}'.format(i + 1, p['name']))
+
+
+def command_ls(spotify, args, cmd_arg_list):
+    p = ArgumentParser()
+    p.add_argument('playlist')
+    playlist = p.parse_args(cmd_arg_list).playlist
+    playlist = get_playlist_by_name(spotify, playlist)
+
+    tempo_cat = TempoCatalog(spotify, args.user)
+
+    tracks = get_playlist_tracks(spotify, args.user, playlist)
+    features = get_tracks_features(spotify, tracks)
+
+    def get_color(tempo):
+        if not tempo:
+            return None, None
+        if tempo <= 82:
+            return 'green', None
+        elif tempo <= 102:
+            return 'white', None
+        elif tempo <= 122:
+            return 'yellow', None
+        else:
+            return 'red', None
+
+    time = timedelta(seconds=0)
+    for i, (t, f) in enumerate(zip(tracks, features)):
+        idx = i + 1
+        name = t['name']
+        duration = timedelta(seconds=t['duration_ms'] // 1000)
+        time += duration
+        tempo = tempo_cat.get_tempo(t['id'], '')
+        c = get_color(tempo)
+        cprint('{idx:3}. {name:32.32} {tempo:3}  {duration}    {time}'.format(**locals()),
+               color=c[0], on_color=c[1])
+
+
+def select_device(spotify):
+    devices = spotify.devices()['devices']
+    for i, d in enumerate(devices):
+        print('{:3}. {:32.32} {}'.format(i + 1, d['name'], d['type']))
+    finished = False
+    while not finished:
+        nb = input('Select device for playback [1-{}] >>> '.format(len(devices)))
+        nb = int(nb)
+        if 0 <= nb - 1 <= len(devices):
+            return devices[nb - 1]['id']
+        else:
+            print('Invalid value')
+
+
+def command_bpmize(spotify, args, cmd_arg_list):
+    p = ArgumentParser()
+    p.add_argument('playlist')
+    playlist = p.parse_args(cmd_arg_list).playlist
+    playlist = get_playlist_by_name(spotify, playlist)
+
+    tempo_cat = TempoCatalog(spotify, args.user)
+
+    tracks = get_playlist_tracks(spotify, args.user, playlist)
+    tracks = [t for t in tracks if t['id'] not in tempo_cat]
+    features = get_tracks_features(spotify, tracks)
+    print('Found {} tracks outside BPM catalog'.format(len(tracks)))
+    for i, (t, f) in enumerate(zip(tracks, features)):
+        idx = i + 1
+        name = t['name']
+        duration = timedelta(seconds=t['duration_ms'] // 1000)
+        tempo = int(f['tempo'])
+        finished = False
+        while not finished:
+            print('{idx:3}. {name:32.32} ~{tempo:3} bpm'.format(**locals()))
+            cmd = input('[play, add, change] >>> ')
+            if cmd == 'play':
+                devices = spotify.devices()
+                dev_id = select_device(spotify)
+                spotify.start_playback(dev_id, uris=[t['uri']])
+                continue
+
+                # spotify.pause_playback()
+                # print('Selected', cmd)
+
+
+def main():
+    args, cmd_arg_list = parse_args()
+    sp = make_private_client(args.user)
+    globals()['command_' + args.cmd](sp, args, cmd_arg_list)
+
+
+if __name__ == '__main__':
+    main()
