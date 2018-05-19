@@ -10,6 +10,10 @@ certifi = "*"
 requests = "*"
 spotipy = "*"
 Flask = "*"
+Flask-Session = "*"
+Flask-SQLAlchemy = "*"
+python-dotenv = "*"
+psycopg2-binary = "*"
 
 [requires]
 python_version = "3.6"
